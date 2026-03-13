@@ -61,6 +61,9 @@ async def demo_happy_path(backend: OllamaModelBackend) -> None:
         chunking_mode=ChunkingMode.SENTENCE,
     )
 
+    async for chunk in result.astream():
+        print(f"  [chunk] {chunk.strip()}", flush=True)
+
     print_result(result)
 
 
@@ -85,6 +88,7 @@ async def demo_fail_fast(backend: OllamaModelBackend) -> None:
         quick_check_requirements=quick_checks,
         chunking_mode=ChunkingMode.SENTENCE,
     )
+    await result.acomplete()
 
     print_result(result)
 
