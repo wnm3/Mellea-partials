@@ -1,5 +1,7 @@
 import openai
 from mellea.backends.openai import OpenAIBackend
+from mellea.core import CBlock, Component
+from mellea.stdlib.components import Document
 
 
 class LMStudioBackend(OpenAIBackend):
@@ -23,3 +25,10 @@ class LMStudioBackend(OpenAIBackend):
         client = openai.OpenAI(api_key="lm-studio", base_url=base_url)
         response = client.models.list()
         return [model.id for model in response.data]
+
+
+class FixedDocument(Document):
+    """Fixed document"""
+
+    def parts(self) -> list[Component | CBlock]:
+        return []
