@@ -10,3 +10,4 @@ wheels/
 .venv
 /fun/
 .idea
+/doc/plan-*
