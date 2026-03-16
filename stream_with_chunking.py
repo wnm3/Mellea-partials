@@ -12,12 +12,11 @@ from collections.abc import AsyncIterator, Callable, Awaitable
 from dataclasses import dataclass, field
 
 from mellea.core.backend import Backend
-from mellea.core.base import ModelOutputThunk
+from mellea.core.base import ModelOutputThunk, Context
 from mellea.core.requirement import Requirement, ValidationResult
 from mellea.stdlib.components.instruction import Instruction
 from mellea.stdlib.context import SimpleContext
 from mellea.stdlib.functional import avalidate
-
 
 OnChunkFailure = Callable[
     [str, list["ValidationResult"], "StreamChunkingResult"],
@@ -79,11 +78,11 @@ def _cancel_thunk(thunk: ModelOutputThunk) -> None:
 
 
 async def _validate_chunk(
-    chunk: str,
-    qc_reqs: list[Requirement | str],
-    backend: Backend,
-    result: StreamChunkingResult,
-    on_failure: OnChunkFailure | None = None,
+        chunk: str,
+        qc_reqs: list[Requirement | str],
+        backend: Backend,
+        result: StreamChunkingResult,
+        on_failure: OnChunkFailure | None = None,
 ) -> tuple[bool, str]:
     """Validate a single chunk. Returns (passed, chunk_text)."""
     if not chunk.strip():
@@ -108,13 +107,15 @@ async def _validate_chunk(
 
 
 async def stream_with_chunking(
-    instruction: Instruction,
-    backend: Backend,
-    *,
-    quick_check_requirements: list[Requirement | str] | None = None,
-    chunking_mode: ChunkingMode = ChunkingMode.SENTENCE,
-    model_options: dict | None = None,
-    on_chunk_failure: OnChunkFailure | None = None,
+        instruction: Instruction,
+        backend: Backend,
+        ctx: Context,
+        *,
+        quick_check_requirements: list[Requirement | str] | None = None,
+        chunking_mode: ChunkingMode = ChunkingMode.SENTENCE,
+        model_options: dict | None = None,
+        on_chunk_failure: OnChunkFailure | None = None,
+        quick_check_backend: Backend | None = None,
 ) -> StreamChunkingResult:
     """Stream LLM output, validating chunks against quick-check requirements.
 
@@ -123,11 +124,13 @@ async def stream_with_chunking(
     ``await result.acomplete()`` to wait for all processing to finish.
     """
     result = StreamChunkingResult()
+    if quick_check_backend is None:
+        quick_check_backend = backend
+
 
     async def _run() -> None:
         try:
-            ctx = SimpleContext()
-            thunk, ctx = await backend.generate_from_context(
+            thunk, new_ctx = await backend.generate_from_context(
                 instruction, ctx, model_options=model_options
             )
 
@@ -145,7 +148,11 @@ async def stream_with_chunking(
 
                 for chunk in parts[:-1]:
                     if qc_reqs:
-                        passed, chunk = await _validate_chunk(chunk, qc_reqs, backend, result, on_chunk_failure)
+                        passed, chunk = await _validate_chunk(chunk,
+                                                              qc_reqs,
+                                                              quick_check_backend,
+                                                              result,
+                                                              on_chunk_failure)
                         if not passed:
                             result.completed = False
                             _cancel_thunk(thunk)
@@ -153,15 +160,17 @@ async def stream_with_chunking(
                     result.validated_chunks.append(chunk)
                     await result._chunk_queue.put(chunk)
 
-
-
-            # Validate remaining buffer from final text
+            # Validate remaining buffer from the final text
             final_parts = pattern.split(result.full_text)
             already_done = len(result.validated_chunks)
             for i in range(already_done, len(final_parts)):
                 chunk = final_parts[i]
                 if qc_reqs:
-                    passed, chunk = await _validate_chunk(chunk, qc_reqs, backend, result, on_chunk_failure)
+                    passed, chunk = await _validate_chunk(chunk,
+                                                          qc_reqs,
+                                                          quick_check_backend,
+                                                          result,
+                                                          on_chunk_failure)
                     if not passed:
                         result.completed = False
                         _cancel_thunk(thunk)
@@ -172,15 +181,6 @@ async def stream_with_chunking(
             result.full_text = "".join(result.validated_chunks)
             result.completed = True
 
-            # Phase 2: full-output validation against instruction requirements
-            if instruction.requirements:
-                full_ctx = SimpleContext()
-                result.full_validation_results = await avalidate(
-                    instruction.requirements,
-                    full_ctx,
-                    backend,
-                    output=ModelOutputThunk(result.full_text),
-                )
         except BaseException:
             result.completed = False
             raise
