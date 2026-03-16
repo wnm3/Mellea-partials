@@ -5,6 +5,8 @@ Two-phase validation:
 2. Full output checks: validated once after complete output (instruction requirements)
 """
 
+from __future__ import annotations
+
 import asyncio
 import enum
 import re
@@ -17,26 +19,6 @@ from mellea.core.requirement import Requirement, ValidationResult
 from mellea.stdlib.components.instruction import Instruction
 from mellea.stdlib.context import SimpleContext
 from mellea.stdlib.functional import avalidate
-
-OnChunkFailure = Callable[
-    [str, list["ValidationResult"], "StreamChunkingResult"],
-    Awaitable[str | None],
-]
-
-
-class ChunkingMode(enum.Enum):
-    SENTENCE = "sentence"
-    WORD = "word"
-    PARAGRAPH = "paragraph"
-
-
-_SPLIT_PATTERNS: dict[ChunkingMode, re.Pattern[str]] = {
-    ChunkingMode.SENTENCE: re.compile(r"(?<=[.!?])(?=\s+)"),
-    ChunkingMode.WORD: re.compile(r"\s+"),
-    ChunkingMode.PARAGRAPH: re.compile(r"\n\n+"),
-}
-
-_SENTINEL = None
 
 
 @dataclass
@@ -64,11 +46,32 @@ class StreamChunkingResult:
                 return
             yield item
 
-    async def acomplete(self) -> "StreamChunkingResult":
+    async def acomplete(self) -> StreamChunkingResult:
         """Wait for the background task to finish and return self."""
         if self._task is not None:
             await self._task
         return self
+
+
+OnChunkFailure = Callable[
+    [str, list[ValidationResult], StreamChunkingResult],
+    Awaitable[str | None],
+]
+
+
+class ChunkingMode(enum.Enum):
+    SENTENCE = "sentence"
+    WORD = "word"
+    PARAGRAPH = "paragraph"
+
+
+_SPLIT_PATTERNS: dict[ChunkingMode, re.Pattern[str]] = {
+    ChunkingMode.SENTENCE: re.compile(r"(?<=[.!?])(?=\s+)"),
+    ChunkingMode.WORD: re.compile(r"\s+"),
+    ChunkingMode.PARAGRAPH: re.compile(r"\n\n+"),
+}
+
+_SENTINEL = None
 
 
 def _cancel_thunk(thunk: ModelOutputThunk) -> None:
@@ -126,7 +129,6 @@ async def stream_with_chunking(
     result = StreamChunkingResult()
     if quick_check_backend is None:
         quick_check_backend = backend
-
 
     async def _run() -> None:
         try:
