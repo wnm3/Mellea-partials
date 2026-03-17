@@ -1,11 +1,11 @@
 # `stream_instruct`
 
-Streaming counterpart to `MelleaSession.instruct()`. Emits a rich event stream covering chunks, quick-check results, repairs, retries, and completion. Registered as a powerup on `MelleaSession` — import `stream_instruct` to activate it.
+Streaming counterpart to `MelleaSession.instruct()`. Emits a rich event stream covering chunks, quick-check results, repairs, retries, and completion. Registered as a powerup on `MelleaSession` — import `mellea_partial` to activate it.
 
 ## Usage
 
 ```python
-import stream_instruct  # activates the powerup
+import mellea_partial  # activates the powerup
 
 result = await session.stream_instruct(
     "Write a short story about a robot.",
@@ -28,9 +28,9 @@ print(result.success, result.final_text)
 | `description` | `str` | — | Instruction description forwarded to `Instruction`. |
 | `requirements` | `list[Requirement \| str] \| None` | `None` | Full-output requirements validated after streaming completes. |
 | `quick_check_requirements` | `list[Requirement \| str] \| None` | `None` | Per-chunk requirements validated during streaming. |
+| `quick_repair` | `ChunkRepair \| None` | `None` | Callback invoked when a chunk fails quick checks. Can fix and continue, or signal abort. See [quick_repair](#quick_repair) below. |
 | `strategy` | `BaseSamplingStrategy \| None` | `None` | Controls retry/repair logic. `None` = single attempt, no full-output validation. |
-| `chunking_mode` | `ChunkingMode` | `SENTENCE` | How to split the stream into chunks (`SENTENCE`, `PARAGRAPH`, etc.). |
-| `on_chunk_failure` | `OnChunkFailure \| None` | `None` | Callback invoked when a chunk fails quick checks. Return a repaired string or `None`. |
+| `chunking` | `ChunkingMode \| ChunkingStrategy` | `SENTENCE` | How to split the stream into chunks. |
 | `model_options` | `dict \| None` | `None` | Extra options forwarded to the backend. |
 | `icl_examples` | | `None` | In-context learning examples. |
 | `grounding_context` | | `None` | Grounding context dict. |
@@ -54,7 +54,7 @@ stream_instruct()
 
 1. **Generate** — calls `backend.generate_from_context()` to get a streaming `ModelOutputThunk`.
 2. **Chunk + quick-check** — reads deltas, splits by the chunking pattern, runs quick-check requirements on each chunk. Emits `ChunkEvent` and `QuickCheckEvent` per chunk.
-3. **Quick-check failure** — cancels the thunk, emits `RetryEvent(reason="quick check failed")`, and immediately retries **without** calling `strategy.repair()`.
+3. **Quick-check failure** — if `quick_repair` is set, calls it first; see [quick_repair](#quick_repair). If the chunk still fails (or no repair is set), cancels the thunk, emits `RetryEvent(reason="quick check failed")`, and immediately retries **without** calling `strategy.repair()`.
 4. **Full-output validation** — once all chunks pass, reassembles the full text and validates against full-output requirements.
 5. **Success** — emits `CompletedEvent(success=True)`, updates `session.ctx`, returns.
 6. **Full-validation failure** — calls `strategy.repair()` to produce an updated instruction and context for the next attempt, emits `RetryEvent(reason="full validation failed")`.
@@ -63,6 +63,57 @@ stream_instruct()
 ### No strategy / no requirements
 
 If `strategy=None` and no `requirements` are provided, the loop runs exactly once and succeeds as long as all quick checks pass.
+
+## quick_repair
+
+`quick_repair` is an async callable with this signature:
+
+```python
+async def quick_repair(
+    chunk: str,
+    ctx: Context,
+    qc_reqs: list[Requirement | str],
+    results: list[ValidationResult],
+) -> tuple[bool, str]:
+    ...
+```
+
+| Return value | Meaning |
+|---|---|
+| `(True, repaired_text)` | Use `repaired_text` in place of the original chunk and continue streaming. Emits `ChunkRepairedEvent`. |
+| `(False, any_text)` | Abort streaming for this attempt (same as having no repair). |
+
+`quick_repair` is called only when at least one quick-check requirement fails. The `results` list corresponds 1-to-1 with `qc_reqs` and carries the `ValidationResult` for each requirement.
+
+### Example — strip leading list numbers
+
+```python
+import re
+
+async def strip_numbering(chunk, ctx, qc_reqs, results):
+    return (True, re.sub(r"^\s*\d+[\.\)]\s*", "", chunk))
+
+result = await session.stream_instruct(
+    "Write a haiku about the ocean.",
+    quick_check_requirements=[
+        Requirement(
+            "Chunk must not start with a number.",
+            simple_validate(lambda x: not re.match(r"\s*\d", x)),
+            check_only=True,
+        ),
+    ],
+    quick_repair=strip_numbering,
+)
+```
+
+When a chunk fails, `strip_numbering` removes the leading number and returns `(True, fixed)`. `ChunkRepairedEvent` is emitted and streaming continues with the fixed text.
+
+To abort instead (e.g. if the repair is not possible):
+
+```python
+async def abort_on_failure(chunk, ctx, qc_reqs, results):
+    return (False, chunk)
+```
 
 ## Sampling Strategy
 
@@ -84,9 +135,9 @@ All events inherit from `StreamEvent` (carries a `timestamp`).
 
 | Event | Fields | Emitted when |
 |---|---|---|
-| `ChunkEvent` | `text`, `chunk_index`, `attempt` | A validated chunk is ready |
+| `ChunkEvent` | `text`, `chunk_index`, `attempt` | A validated (or repaired) chunk is ready |
 | `QuickCheckEvent` | `chunk_index`, `attempt`, `passed`, `results` | Quick checks run on a chunk |
-| `ChunkRepairedEvent` | `chunk_index`, `attempt`, `original`, `repaired` | `on_chunk_failure` successfully repairs a chunk |
+| `ChunkRepairedEvent` | `chunk_index`, `attempt`, `original`, `repaired` | `quick_repair` returns `(True, repaired_text)` |
 | `StreamingDoneEvent` | `attempt`, `full_text` | All chunks for an attempt received and passed quick checks |
 | `FullValidationEvent` | `attempt`, `passed`, `results` | Full-output validation completes |
 | `RetryEvent` | `attempt`, `reason` | A new attempt is about to begin |
@@ -111,7 +162,7 @@ Per-attempt bookkeeping stored in `StreamInstructResult.attempts`.
 | Field | Description |
 |---|---|
 | `attempt_index` | Zero-based attempt number |
-| `validated_chunks` | Chunks that passed all quick checks |
+| `validated_chunks` | Chunks that passed all quick checks (after any repair) |
 | `quick_check_results` | Per-chunk list of `ValidationResult` |
 | `full_validation_results` | `list[tuple[Requirement, ValidationResult]]` or `None` |
 | `full_text` | Accumulated raw text for this attempt |
