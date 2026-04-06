@@ -19,6 +19,7 @@ from mellea_partial.instruct import (
     StreamEvent,
     StreamingDoneEvent,
     StreamInstructResult,
+    ToolCallEvent,
     stream_instruct,
 )
 
@@ -41,5 +42,6 @@ __all__ = [
     "StreamEvent",
     "StreamingDoneEvent",
     "StreamInstructResult",
+    "ToolCallEvent",
     "stream_instruct",
 ]

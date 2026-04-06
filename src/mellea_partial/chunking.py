@@ -30,6 +30,7 @@ class StreamChunkingResult:
     full_validation_results: list[ValidationResult] | None = None
     completed: bool = False
     full_text: str = ""
+    tool_calls: dict | None = None
     _chunk_queue: asyncio.Queue[str | None] = field(
         default_factory=asyncio.Queue, repr=False
     )
@@ -140,6 +141,7 @@ async def stream_with_chunking(
         model_options: dict | None = None,
         quick_repair: ChunkRepair | None = None,
         quick_check_backend: Backend | None = None,
+        tool_calls: bool = False,
 ) -> StreamChunkingResult:
     """Stream LLM output, validating chunks against quick-check requirements.
 
@@ -154,7 +156,7 @@ async def stream_with_chunking(
     async def _run() -> None:
         try:
             thunk, new_ctx = await backend.generate_from_context(
-                instruction, ctx, model_options=model_options
+                instruction, ctx, model_options=model_options, tool_calls=tool_calls,
             )
 
             qc_reqs: list[Requirement | str] = quick_check_requirements or []
@@ -205,6 +207,10 @@ async def stream_with_chunking(
 
             result.full_text = "".join(result.validated_chunks)
             result.completed = True
+
+            # Capture tool calls from the thunk if present
+            if thunk.tool_calls:
+                result.tool_calls = thunk.tool_calls
 
         except BaseException:
             result.completed = False
