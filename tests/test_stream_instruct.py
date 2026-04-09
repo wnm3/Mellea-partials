@@ -31,6 +31,7 @@ from mellea_partial import (  # importing activates the powerup  # noqa: F401
     RetryEvent,
     StreamingDoneEvent,
     StreamInstructResult,
+    ToolCallEvent,
 )
 
 
@@ -440,3 +441,135 @@ async def test_custom_chunking_strategy():
     assert len(chunks) >= 2
     assert any("first" in c for c in chunks)
     assert any("second" in c for c in chunks)
+
+
+# ─── Tool call mock backend ───────────────────────────────────────────────────
+
+
+class ToolCallMockBackend(Backend):
+    """Mock backend that returns a response with tool_calls set on the thunk."""
+
+    def __init__(self, responses: list[str], tool_calls_data: dict | None = None):
+        self.responses = list(responses)
+        self.tool_calls_data = tool_calls_data
+
+    async def generate_from_raw(self, actions, ctx, **kwargs):
+        raise NotImplementedError
+
+    async def _generate_from_context(
+        self,
+        action,
+        ctx,
+        *,
+        format=None,
+        model_options=None,
+        tool_calls=False,
+    ):
+        response = self.responses.pop(0)
+
+        mot = ModelOutputThunk(None)
+        mot._generate_type = GenerateType.ASYNC
+        mot._action = ModelOutputThunk(response)
+
+        async def _process(m: ModelOutputThunk, chunk_str: str) -> None:
+            if m._underlying_value is None:
+                m._underlying_value = ""
+            m._underlying_value += chunk_str
+
+        async def _post_process(m: ModelOutputThunk) -> None:
+            # Simulate tool calls being populated during post-processing
+            if tool_calls and self.tool_calls_data:
+                m.tool_calls = self.tool_calls_data
+
+        mot._process = _process
+        mot._post_process = _post_process
+
+        async def _generate_task() -> None:
+            await mot._async_queue.put(response)
+            await mot._async_queue.put(None)
+
+        mot._generate = asyncio.create_task(_generate_task())
+
+        new_ctx = ctx.add(action).add(mot)
+        return mot, new_ctx
+
+
+def session_with_tools(
+    responses: list[str], tool_calls_data: dict | None = None,
+) -> MelleaSession:
+    return MelleaSession(
+        ToolCallMockBackend(responses, tool_calls_data), SimpleContext(),
+    )
+
+
+# ─── Tool call tests ──────────────────────────────────────────────────────────
+
+
+SAMPLE_TOOL_CALLS = {
+    "get_weather": {
+        "name": "get_weather",
+        "arguments": '{"location": "San Francisco"}',
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_tool_calls_event_emitted():
+    """When tool_calls=True and backend returns tool calls, a ToolCallEvent is emitted."""
+    m = session_with_tools(["Checking the weather."], SAMPLE_TOOL_CALLS)
+    result = await m.stream_instruct(
+        "What's the weather?",
+        tool_calls=True,
+    )
+
+    events = await collect_events(result)
+
+    tc_events = [e for e in events if isinstance(e, ToolCallEvent)]
+    assert len(tc_events) == 1
+    assert tc_events[0].tool_calls == SAMPLE_TOOL_CALLS
+
+    completed = next(e for e in events if isinstance(e, CompletedEvent))
+    assert completed.success is True
+
+
+@pytest.mark.asyncio
+async def test_tool_calls_on_result():
+    """result.tool_calls is populated after completion when tools are called."""
+    m = session_with_tools(["Checking the weather."], SAMPLE_TOOL_CALLS)
+    result = await m.stream_instruct(
+        "What's the weather?",
+        tool_calls=True,
+    )
+    await result.acomplete()
+
+    assert result.tool_calls == SAMPLE_TOOL_CALLS
+    assert result.attempts[0].tool_calls == SAMPLE_TOOL_CALLS
+
+
+@pytest.mark.asyncio
+async def test_tool_calls_false_no_event():
+    """When tool_calls=False (default), no ToolCallEvent is emitted even with tool data."""
+    m = session_with_tools(["Hello world."], SAMPLE_TOOL_CALLS)
+    result = await m.stream_instruct("Say something.")
+
+    events = await collect_events(result)
+
+    tc_events = [e for e in events if isinstance(e, ToolCallEvent)]
+    assert len(tc_events) == 0
+    assert result.tool_calls is None
+
+
+@pytest.mark.asyncio
+async def test_tool_calls_no_tools_returned():
+    """When tool_calls=True but backend returns no tool calls, no ToolCallEvent."""
+    m = session_with_tools(["Just text response."], tool_calls_data=None)
+    result = await m.stream_instruct(
+        "Say something.",
+        tool_calls=True,
+    )
+
+    events = await collect_events(result)
+
+    tc_events = [e for e in events if isinstance(e, ToolCallEvent)]
+    assert len(tc_events) == 0
+    assert result.tool_calls is None

@@ -98,6 +98,14 @@ class RetryEvent(StreamEvent):
 
 
 @dataclass
+class ToolCallEvent(StreamEvent):
+    """Emitted when the model returns tool calls instead of (or alongside) text."""
+
+    attempt: int = 0
+    tool_calls: dict | None = None
+
+
+@dataclass
 class CompletedEvent(StreamEvent):
     """Emitted once processing is fully done (success or budget exhausted)."""
 
@@ -122,6 +130,7 @@ class AttemptRecord:
     full_validation_passed: bool = False
     context: object = None
     thunk: ModelOutputThunk | None = None
+    tool_calls: dict | None = None
 
 
 # ─── StreamInstructResult ───────────────────────────────────────────────────────
@@ -141,6 +150,7 @@ class StreamInstructResult:
     attempts: list[AttemptRecord] = field(default_factory=list)
     success: bool = False
     final_text: str = ""
+    tool_calls: dict | None = None
     _event_queue: asyncio.Queue[StreamEvent | None] = field(
         default_factory=asyncio.Queue, repr=False
     )
@@ -254,6 +264,7 @@ async def _run(
     model_options: dict | None,
     initial_context: object,
     session: "MelleaSession",
+    tool_calls: bool = False,
 ) -> None:
     """Background coroutine that drives streaming, chunking, quick checks, and retries."""
     loop_budget = strategy.loop_budget if strategy is not None else 1
@@ -286,7 +297,8 @@ async def _run(
 
             # ── 1. Generate ──────────────────────────────────────────────────
             thunk, result_ctx = await backend.generate_from_context(
-                next_action, ctx=next_context, model_options=model_options
+                next_action, ctx=next_context, model_options=model_options,
+                tool_calls=tool_calls,
             )
             attempt_rec.thunk = thunk
             attempt_rec.context = result_ctx
@@ -357,6 +369,14 @@ async def _run(
             await result._event_queue.put(
                 StreamingDoneEvent(attempt=attempt_idx, full_text=attempt_rec.full_text)
             )
+
+            # ── 4b. Capture tool calls from the thunk if present ───────────
+            if thunk.tool_calls:
+                attempt_rec.tool_calls = thunk.tool_calls
+                result.tool_calls = thunk.tool_calls
+                await result._event_queue.put(
+                    ToolCallEvent(attempt=attempt_idx, tool_calls=thunk.tool_calls)
+                )
 
             # ── 5. Full-output validation ────────────────────────────────────
             if reqs:
@@ -470,6 +490,7 @@ async def stream_instruct(
     chunking: ChunkingMode | ChunkingStrategy = ChunkingMode.SENTENCE,
     quick_repair: ChunkRepair | None = None,
     model_options: dict | None = None,
+    tool_calls: bool = False,
 ) -> StreamInstructResult:
     """Stream LLM output with per-chunk quick checks and optional sampling strategies.
 
@@ -495,6 +516,9 @@ async def stream_instruct(
         chunking: How to split the stream into chunks (ChunkingMode enum or ChunkingStrategy).
         quick_repair: Optional callback invoked when a chunk fails quick checks.
         model_options: Extra model options forwarded to the backend.
+        tool_calls: If ``True``, enable tool calling on the backend so the model
+            can request tool invocations.  Tool call results are exposed via
+            ``ToolCallEvent`` in the event stream and ``result.tool_calls``.
 
     Returns:
         A ``StreamInstructResult`` with a running background task.
@@ -524,6 +548,7 @@ async def stream_instruct(
             model_options=model_options,
             initial_context=session.ctx,
             session=session,
+            tool_calls=tool_calls,
         )
     )
     return sr

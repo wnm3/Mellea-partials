@@ -30,6 +30,7 @@ class StreamChunkingResult:
     full_validation_results: list[ValidationResult] | None = None
     completed: bool = False
     full_text: str = ""
+    tool_calls: dict | None = None
     _chunk_queue: asyncio.Queue[str | None] = field(
         default_factory=asyncio.Queue, repr=False
     )
@@ -140,6 +141,7 @@ async def stream_with_chunking(
         model_options: dict | None = None,
         quick_repair: ChunkRepair | None = None,
         quick_check_backend: Backend | None = None,
+        tool_calls: bool = False,
 ) -> StreamChunkingResult:
     """Stream LLM output, validating chunks against quick-check requirements.
 
@@ -154,7 +156,7 @@ async def stream_with_chunking(
     async def _run() -> None:
         try:
             thunk, new_ctx = await backend.generate_from_context(
-                instruction, ctx, model_options=model_options
+                instruction, ctx, model_options=model_options, tool_calls=tool_calls,
             )
 
             qc_reqs: list[Requirement | str] = quick_check_requirements or []
@@ -183,6 +185,37 @@ async def stream_with_chunking(
                             return
                     result.validated_chunks.append(chunk)
                     await result._chunk_queue.put(chunk)
+
+            # Check for tool calls before processing remaining text.
+            # When the model returns tool calls, text content is typically
+            # empty — yield the serialized tool calls as a chunk so the
+            # consumer sees them via astream().
+            if thunk.tool_calls:
+                import json
+                result.tool_calls = thunk.tool_calls
+                tc_list = []
+                for _tc_name, tc in thunk.tool_calls.items():
+                    # Handle both ModelToolCall objects and plain dicts
+                    if hasattr(tc, "name"):
+                        name = tc.name
+                        args = json.dumps(dict(tc.args))
+                    else:
+                        name = tc.get("name", _tc_name)
+                        args = tc.get("arguments", "{}")
+                    tc_list.append({
+                        "function": {
+                            "name": name,
+                            "arguments": args,
+                        }
+                    })
+                tc_json = json.dumps({"tool_calls": tc_list})
+                # When tool calls are returned without text content,
+                # yield the serialized tool calls as a chunk so
+                # consumers see them via astream().
+                if not result.full_text.strip():
+                    result.validated_chunks.append(tc_json)
+                    await result._chunk_queue.put(tc_json)
+                    result.full_text = tc_json
 
             # Validate remaining buffer from the final text
             final_parts = chunker.split(result.full_text)
